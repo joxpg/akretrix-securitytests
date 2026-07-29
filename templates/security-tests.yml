@@ -1,0 +1,97 @@
+# Copy this into a frontend repo and adjust SCAN_PATH / SITE_URL.
+#
+# Two jobs on purpose: the static gate blocks a merge, while the runtime review
+# checks how the deployed environment is configured — headers, TLS and exposed
+# files, none of which are visible in the source.
+name: Security tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Nightly, so certificate expiry and a dropped header surface before a
+    # customer finds them.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: Static code review
+    runs-on: ubuntu-latest
+    env:
+      SCAN_PATH: .
+    steps:
+      - name: Checkout the frontend
+        uses: actions/checkout@v4
+
+      - name: Checkout the security tests
+        uses: actions/checkout@v4
+        with:
+          repository: organization-akretrix/akretrix-securitytests
+          path: .securitytests
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Confirms the checks still detect their defects. Without this a silently
+      # broken check produces a clean report, which is worse than no report.
+      - name: Self-test the scanner
+        working-directory: .securitytests
+        run: npm run selftest
+
+      - name: Scan
+        run: |
+          node .securitytests/bin/akretrix-sec.js code "$SCAN_PATH" \
+            --fail-on high \
+            --show-passed
+
+      - name: Scan (JSON artefact)
+        if: always()
+        run: |
+          node .securitytests/bin/akretrix-sec.js code "$SCAN_PATH" \
+            --json --fail-on never > security-static.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-static
+          path: security-static.json
+
+  runtime:
+    name: Runtime review of the deployed site
+    # Only after a real deploy, and on the nightly schedule. Skipped on PRs,
+    # where there is nothing deployed to look at.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      SITE_URL: https://akretrix.com
+    steps:
+      - name: Checkout the security tests
+        uses: actions/checkout@v4
+        with:
+          repository: organization-akretrix/akretrix-securitytests
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Scan the deployed site
+        run: |
+          node bin/akretrix-sec.js url "$SITE_URL" \
+            --fail-on medium \
+            --show-passed
+
+      - name: Scan (JSON artefact)
+        if: always()
+        run: node bin/akretrix-sec.js url "$SITE_URL" --json --fail-on never > security-runtime.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-runtime
+          path: security-runtime.json

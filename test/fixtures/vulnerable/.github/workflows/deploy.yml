@@ -1,0 +1,30 @@
+# FIXTURE — intentionally insecure. See ../../index.html.
+# Reproduces the publish-surface and CI defects found in the real pipeline.
+name: Deploy (insecure fixture)
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: write        # CODE-09: more than a deploy needs
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # CODE-09: third-party action on a mutable ref
+      - uses: some-vendor/deploy-action@main
+
+      # CODE-09: attacker-controlled data interpolated into a shell step
+      - name: Announce
+        run: echo "Deploying ${{ github.event.head_commit.message }}"
+
+      # CODE-08: publishes the repo root behind a deny-list
+      - name: Sync
+        run: |
+          aws s3 sync ./ s3://example-public-bucket/ \
+            --exclude ".git/*" \
+            --delete

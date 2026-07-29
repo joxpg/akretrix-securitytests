@@ -1,0 +1,20 @@
+{
+  "name": "akretrix-securitytests",
+  "version": "1.0.0",
+  "description": "Security test suite for AkreTrix frontends and their deploy pipelines. Two modes: static review of a local checkout, and runtime review of a deployed URL.",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "akretrix-sec": "bin/akretrix-sec.js"
+  },
+  "scripts": {
+    "code": "node bin/akretrix-sec.js code",
+    "url": "node bin/akretrix-sec.js url",
+    "selftest": "node test/selftest.js"
+  },
+  "dependencies": {}
+}

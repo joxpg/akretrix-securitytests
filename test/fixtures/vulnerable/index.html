@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!--
+  FIXTURE — intentionally insecure. Not deployed, not linked from anywhere.
+  Exists so `npm run selftest` proves the scanner still catches each class of
+  defect. Every issue here mirrors one found in a real AkreTrix frontend.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- CODE-06: browsers ignore these as meta tags -->
+  <meta http-equiv="X-Content-Type-Options" content="nosniff">
+  <meta http-equiv="Strict-Transport-Security" content="max-age=31536000">
+  <!-- CODE-07: no Content-Security-Policy at all -->
+  <title>Vulnerable fixture</title>
+  <!-- CODE-14: plaintext subresource -->
+  <script src="http://cdn.example.com/lib.js"></script>
+</head>
+<body>
+  <div id="out"></div>
+  <!-- CODE-16: no rel="noopener" -->
+  <a href="https://example.com" target="_blank">External</a>
+
+  <script>
+    // CODE-01: remote data straight into innerHTML
+    async function render(domain) {
+      const res = await fetch('https://dns.example/resolve?name=' + domain);
+      const json = await res.json();
+      const rows = json.Answer.map(a => `<div>${a.name} -> ${a.data}</div>`).join('');
+      document.getElementById('out').innerHTML = `<h2>${domain}</h2>${rows}`;
+    }
+
+    // CODE-02: escape helper missing quotes
+    function escapeHtml(str) {
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // CODE-10: dynamic code execution
+    function calc(expr) { return eval(expr); }
+
+    // CODE-11: credential in web storage
+    localStorage.setItem('auth_token', 'abc123');
+
+    render('example.com');
+  </script>
+</body>
+</html>
