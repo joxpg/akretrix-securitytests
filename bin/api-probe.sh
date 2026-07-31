@@ -12,7 +12,13 @@
 # real email. Method handling is probed without a payload.
 #
 # Usage:
-#   ./bin/api-probe.sh <base-url> [expected-origin]
+#   ./bin/api-probe.sh <base-url> [expected-origin] [--verify-captcha-gate]
+#
+# --verify-captcha-gate sends ONE POST with no anti-bot token, to prove the
+# endpoint rejects it. This is the only probe that sends a body, which is why it
+# is opt-in: on an endpoint whose captcha check runs AFTER its side effects, that
+# POST would still send the email or write the record. Confirm the ordering before
+# using it.
 #
 # Examples:
 #   ./bin/api-probe.sh https://abc123.lambda-url.us-east-1.on.aws/ https://akretrix.com
@@ -20,6 +26,17 @@
 # Run only against endpoints your organisation controls.
 
 set -uo pipefail
+
+VERIFY_CAPTCHA_GATE=0
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --verify-captcha-gate) VERIFY_CAPTCHA_GATE=1; shift ;;
+    -h|--help) sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
 
 API="${1:-}"
 EXPECTED_ORIGIN="${2:-}"
@@ -202,7 +219,98 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-head1 "7. Rate limiting"
+head1 "7. Credential exposure in responses"
+# An API can leak a secret in ways the source scan cannot see: an error handler
+# that serialises its config, a debug branch left enabled, a header added by a
+# proxy. These probes read only what the endpoint volunteers.
+CRED_PATTERN='AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|xox[baprs]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9]{16,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{35}|(postgres|mysql|mongodb)(\+srv)?://[^[:space:]:@/]+:[^[:space:]:@/]+@'
+# Anything a caller could send that might get echoed back into an error.
+CRED_PROBES=("" "?tool=__probe__" "?debug=1" "?verbose=true" "?tool=curl&url=" "?config=1")
+CRED_HITS=0
+for probe in "${CRED_PROBES[@]}"; do
+  if [[ -z "$probe" ]]; then resp="$(body "$API"; hdr "$API")"; else resp="$(body "$(with_query "${probe#\?}")")"; fi
+  # Placeholders and vendor test values are not leaks.
+  filtered="$(grep -oE "$CRED_PATTERN" <<<"$resp" 2>/dev/null | grep -viE 'EXAMPLE|YOUR[_-]|PLACEHOLDER|DUMMY|REDACTED|SAMPLE' || true)"
+  if [[ -n "$filtered" ]]; then
+    CRED_HITS=$((CRED_HITS+1))
+    # Redacted: this output gets attached to CI runs.
+    fail "response leaks a credential-shaped value for '${probe:-/}': $(head -c 12 <<<"$filtered")… (rotate it, then remove it from the response)"
+  fi
+done
+
+# Env/config keys echoed into a body are the usual precursor to a real leak.
+ENV_ECHO="$(body "$(with_query 'tool=__probe__')" | grep -oiE '"(env|environment|config|secret|process)"[[:space:]]*:' || true)"
+if [[ -n "$ENV_ECHO" ]]; then
+  fail "response serialises configuration state ($ENV_ECHO) — one refactor away from including a secret"
+  CRED_HITS=$((CRED_HITS+1))
+fi
+
+# Headers a proxy or framework sometimes adds.
+LEAKY_HDRS="$(hdr "$API" | tr -d '\r' | grep -iE '^(x-amz-security-token|authorization|x-api-key|set-cookie):' || true)"
+if [[ -n "$LEAKY_HDRS" ]]; then
+  fail "response returns a credential-bearing header: $(cut -d: -f1 <<<"$LEAKY_HDRS" | tr '\n' ' ')"
+  CRED_HITS=$((CRED_HITS+1))
+fi
+
+if (( CRED_HITS == 0 )); then
+  pass "no credentials, config dumps or credential-bearing headers in ${#CRED_PROBES[@]} probed responses"
+fi
+
+# --------------------------------------------------------------------------- #
+head1 "8. Anti-bot gate (opt-in: --verify-captcha-gate)"
+# Fail-closed behaviour is invisible from the source: the secret could be unset in
+# this environment, the IAM grant to read it could be missing, or a CloudFormation
+# dynamic reference could have shipped unresolved. All three produce a working
+# deploy and a defenceless form. Only a live request distinguishes them.
+if (( VERIFY_CAPTCHA_GATE == 1 )); then
+  GATE_BODY='{"fullName":"akretrix-securitytests probe","workEmail":"probe@example.invalid","service":"security-probe","message":"Automated anti-bot gate check. No token supplied; this must be rejected.","submitDurationMs":9000}'
+  GATE_RESP="$(curl -sS -o - -w '\n<<HTTP:%{http_code}>>' --max-time "$TIMEOUT" \
+    -X POST "$API" \
+    -H 'Content-Type: application/json' \
+    ${EXPECTED_ORIGIN:+-H "Origin: $EXPECTED_ORIGIN"} \
+    -d "$GATE_BODY" 2>/dev/null || true)"
+  GATE_CODE="$(grep -oE '<<HTTP:[0-9]+>>' <<<"$GATE_RESP" | grep -oE '[0-9]+' || echo 0)"
+  GATE_JSON="$(sed 's/<<HTTP:[0-9]*>>//' <<<"$GATE_RESP")"
+
+  if grep -qiE '"(success|ok)"[[:space:]]*:[[:space:]]*true' <<<"$GATE_JSON"; then
+    fail "endpoint ACCEPTED a submission with no anti-bot token (HTTP $GATE_CODE) — the gate is not enforced, or it fails OPEN"
+  elif [[ "$GATE_CODE" == "403" ]]; then
+    warn "rejected at the Origin check (HTTP 403) before reaching the anti-bot gate — pass the expected origin as the 2nd argument to test the gate itself"
+  elif [[ "$GATE_CODE" =~ ^(400|401|422)$ ]]; then
+    CODE_FIELD="$(grep -oE '"code"[[:space:]]*:[[:space:]]*"[^"]+"' <<<"$GATE_JSON" | cut -d'"' -f4 || true)"
+    # A 4xx alone proves nothing. An endpoint that rejects the request for an
+    # unrelated reason — a missing query parameter, a schema mismatch — looks
+    # identical, and calling that a pass reports an anti-bot control the endpoint
+    # does not have. Require the response to actually mention one.
+    if grep -qiE 'captcha|turnstile|recaptcha|hcaptcha|verification failed|challenge' <<<"$GATE_JSON"; then
+      pass "tokenless submission rejected by the anti-bot gate (HTTP $GATE_CODE${CODE_FIELD:+, code=$CODE_FIELD})"
+      # A misconfigured secret and a bad token are different problems; the
+      # endpoint should say which, so an operator is not left guessing.
+      [[ -z "$CODE_FIELD" ]] && warn "rejection carried no machine-readable code — the frontend cannot tell an expired challenge from a genuine failure"
+    else
+      info "rejected with HTTP $GATE_CODE, but for an unrelated reason ($(head -c 70 <<<"$GATE_JSON" | tr -d '\n')) — no anti-bot gate detected on this endpoint"
+    fi
+  elif [[ "$GATE_CODE" == "500" ]]; then
+    CODE_FIELD="$(grep -oE '"code"[[:space:]]*:[[:space:]]*"[^"]+"' <<<"$GATE_JSON" | cut -d'"' -f4 || true)"
+    if [[ "$CODE_FIELD" == *misconfigured* ]]; then
+      fail "the anti-bot secret is NOT configured in this environment (code=$CODE_FIELD) — it fails closed, so the form currently rejects every genuine submission too"
+    else
+      fail "tokenless submission caused a server error (HTTP 500) instead of a clean rejection"
+    fi
+  elif [[ "$GATE_CODE" == "503" ]]; then
+    warn "verifier unreachable from the server (HTTP 503) — fails closed, but the form is rejecting real users right now"
+  elif [[ "$GATE_CODE" == "405" ]]; then
+    info "endpoint does not accept POST — no anti-bot gate to test here"
+  else
+    warn "unexpected response to a tokenless submission: HTTP $GATE_CODE $(head -c 90 <<<"$GATE_JSON")"
+  fi
+else
+  info "not run — pass --verify-captcha-gate to send one tokenless POST and prove the gate rejects it"
+  info "only do so when the captcha check runs BEFORE any email/database side effect"
+fi
+
+# --------------------------------------------------------------------------- #
+head1 "9. Rate limiting"
 # Intentionally NOT load tested: flooding your own endpoint costs money and is a
 # self-inflicted DoS. Verify the cap in configuration instead.
 info "not probed by design — flooding the endpoint would cost money and be a self-DoS"
