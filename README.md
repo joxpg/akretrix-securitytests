@@ -83,6 +83,8 @@ tell them apart. Triage it; do not silence it.
 | CODE-14 | Plaintext `http://` subresources | medium | Blocked as mixed content, or a downgrade. |
 | CODE-15 | `rejectUnauthorized: false`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, `curl -k` | high | Any response can be forged. Legitimate only for a certificate inspector, and then only if the body is untrusted. |
 | CODE-16 | `target="_blank"` without `rel="noopener"` | low | Reverse tabnabbing. |
+| CODE-17 | Electron sandbox & WebPreferences hardening (`contextIsolation`, `sandbox`, `nodeIntegration: false`) | critical | Insecure Electron settings allow renderer XSS to execute arbitrary OS/Node.js commands. |
+| CODE-18 | Local server listener loopback binding (`127.0.0.1` vs `0.0.0.0`) | high | Unbound desktop listeners expose internal proxy ports to all machines on the local network or public Wi-Fi. |
 
 ### B. Runtime evaluation — `akretrix-sec url <url>`
 
